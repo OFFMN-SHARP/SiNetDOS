@@ -69,18 +69,14 @@ procedure kernel_main is
       Cursor := 0;
    end ClearScreen;
 
-   function Equal (S1 : String; S2 : String) return Boolean is
+   function Equal (S1, S2 : String) return Boolean is
 begin
-   if S1'Length /= S2'Length then
-      return False;
-   end if;
+   if S1'Length /= S2'Length then return False; end if;
    for I in S1'Range loop
-      if S1(I) /= S2(I + (S2'First - S1'First)) then
-         return False;
-      end if;
+      if S1(I) /= S2(I + S2'First - S1'First) then return False; end if;
    end loop;
    return True;
-   end Equal;
+end Equal;
    ------------------------------------------------------
    type Token_Array is array (1 .. 10) of String(1..32);
 Tokens : Token_Array;
@@ -273,6 +269,19 @@ begin
          ParseCmd(Buffer(1..Len));
          PutString(Buffer(1..Len));
          if Count > 0 then
+            if Equal(Tokens(1), "cls") then
+               ClearScreen;
+            elsif Equal(Tokens(1), "echo") then
+               for I in 2 .. Count loop
+                  PutString(Tokens(I));
+                  if I < Count then PutChar(' '); end if;
+               end loop;
+               New_Line;
+            else
+               PutString("Unknown command: ");
+               PutString(Tokens(1));
+               New_Line;
+            end if;
          end if;
          New_Line;
          New_Line;
