@@ -1,15 +1,32 @@
 with System;
 with System.Machine_Code;
 procedure kernel_main is
+   procedure Putln (S : String);
+   procedure Cat_File (FName : String);
    type Word is mod 2**16;
    type Unsigned_8  is mod 2**8;
    type Unsigned_16 is mod 2**16;
+   type Unsigned_32 is mod 2**32;
+   type File_Record is record
+      Name    : String(1..64);
+      Size    : Unsigned_32;
+      Start_LBA : Unsigned_32;
+   end record;
    Screen_Width  : constant := 80;
    Screen_Height : constant := 25;
    Video : array (0 .. Screen_Width * Screen_Height - 1) of Word;
    for Video'Address use System'To_Address (16#B8000#);
    pragma Import (Ada, Video);
    Cursor : Integer := 0;
+   Max_Files : constant := 65536;
+   Superblock_LBA : constant := 0;
+   FileTable_Start_LBA : constant := 1;
+   Data_Start_LBA : constant := 1000;
+   Max_Files       : constant := 65536;
+   FileTable_Start : constant Unsigned_32 := 1;
+   FileTable_End   : constant Unsigned_32 := FileTable_Start + Max_Files - 1;
+   Data_Start_LBA  : constant Unsigned_32 := FileTable_End + 1;
+   Next_Free_File : Integer := 1;
    ----------------------------------------------------------
    procedure Busy_Wait (Milliseconds : Positive) is
       Count : constant Integer := Integer(Milliseconds) * 250_000;
@@ -215,6 +232,210 @@ begin
                              );
       return Result;
    end Port_In;
+   procedure Port_Out (Port : Unsigned_16; Value : Unsigned_8) is
+begin
+   System.Machine_Code.Asm(
+      "outb %0, %1",
+      Inputs  => (Unsigned_8'Asm_Input ("a", Value),
+                  Unsigned_16'Asm_Input ("d", Port)),
+      Volatile => True);
+   end Port_Out;
+   function Shift_Right (Value : Unsigned_32; Amount : Natural) return Unsigned_32 is
+begin
+   return Value / (2**Amount);
+   end Shift_Right;
+   procedure Port_Out_Word (Port : Unsigned_16; Value : Unsigned_16) is
+begin
+   System.Machine_Code.Asm(
+      "outw %0, %1",
+      Inputs  => (Unsigned_16'Asm_Input ("a", Value),
+                  Unsigned_16'Asm_Input ("d", Port)),
+      Volatile => True);
+end Port_Out_Word;
+   ---===========================================--
+   function Port_In_Word (Port : Unsigned_16) return Unsigned_16 is
+   Result : Unsigned_16;
+begin
+   System.Machine_Code.Asm(
+      "inw %1, %0",
+      Outputs  => Unsigned_16'Asm_Output ("=a", Result),
+      Inputs   => Unsigned_16'Asm_Input  ("d", Port),
+      Volatile => True);
+   return Result;
+end Port_In_Word;
+   type Sector_Data is array (0 .. 511) of Unsigned_8;
+type Sector_Words is array (0 .. 255) of Unsigned_16;
+type Sector_Buffer (As_Words : Boolean := False) is record
+   case As_Words is
+      when True  => Words : Sector_Words;
+      when False => Bytes : Sector_Data;
+   end case;
+end record;
+procedure Read_Sector (LBA : Unsigned_32; Buffer : out Sector_Buffer) is
+   use type Unsigned_8;
+   Status : Unsigned_8;
+   LBA_Lo   : constant Unsigned_8 := Unsigned_8(LBA and 16#FF#);
+   LBA_Mid  : constant Unsigned_8 := Unsigned_8(Shift_Right(LBA, 8) and 16#FF#);
+   LBA_Hi   : constant Unsigned_8 := Unsigned_8(Shift_Right(LBA, 16) and 16#FF#);
+begin
+   Port_Out(16#1F6#, 16#E0# or (Unsigned_8(Shift_Right(LBA, 24) and 16#0F#)));
+   Port_Out(16#1F2#, 1);
+   Port_Out(16#1F3#, LBA_Lo);
+   Port_Out(16#1F4#, LBA_Mid);
+   Port_Out(16#1F5#, LBA_Hi);
+   Port_Out(16#1F7#, 16#20#);
+   loop
+         Status := Port_In(16#1F7#);
+         exit when (Status and 16#80#) = 0;
+   end loop;
+   if (Status and 8) = 0 then
+      return;
+   end if;
+   for I in 0 .. 255 loop
+      Buffer.Words(I) := Port_In_Word(16#1F0#);
+   end loop;
+   end Read_Sector;
+   procedure Write_Sector (LBA : Unsigned_32; Buffer : in Sector_Buffer) is
+   use type Unsigned_8;
+   Status : Unsigned_8;
+   LBA_Lo   : constant Unsigned_8 := Unsigned_8(LBA and 16#FF#);
+   LBA_Mid  : constant Unsigned_8 := Unsigned_8(Shift_Right(LBA, 8) and 16#FF#);
+   LBA_Hi   : constant Unsigned_8 := Unsigned_8(Shift_Right(LBA, 16) and 16#FF#);
+begin
+   Port_Out(16#1F6#, 16#E0# or (Unsigned_8(Shift_Right(LBA, 24) and 16#0F#)));
+   Port_Out(16#1F2#, 1);
+   Port_Out(16#1F3#, LBA_Lo);
+   Port_Out(16#1F4#, LBA_Mid);
+   Port_Out(16#1F5#, LBA_Hi);
+   Port_Out(16#1F7#, 16#30#);
+
+   loop
+      Status := Port_In(16#1F7#);
+      exit when (Status and 16#80#) = 0;
+   end loop;
+
+   for I in 0 .. 255 loop
+      Port_Out_Word(16#1F0#, Buffer.Words(I));
+   end loop;
+   end Write_Sector;
+   --================================---
+   procedure Format_Disk is
+   Buf : Sector_Buffer(As_Words => False);
+begin
+   Buf.Bytes := (others => 0);
+   Buf.Bytes(0) := 16#53#; -- 'S'
+   Buf.Bytes(1) := 16#49#;
+   Buf.Bytes(2) := 16#4E#;
+   Buf.Bytes(3) := 16#45#;
+   Write_Sector(Superblock_LBA, Buf);
+   Buf.Bytes := (others => 0);
+   for LBA in FileTable_Start .. FileTable_End loop
+      Write_Sector(LBA, Buf);
+   end loop;
+
+   Putln("Disk formatted. Max files: 65536");
+end Format_Disk;
+   procedure Create_File (FName : String) is
+   Buf : Sector_Buffer(As_Words => False);
+   Rec : File_Record;
+begin
+   if Next_Free_File > Max_Files then
+      Putln("File table full.");
+      return;
+   end if;
+   Rec.Name := (others => ' ');
+   Rec.Name(1..FName'Length) := FName;
+   Rec.Size := 0;
+   Rec.Start_LBA := Data_Start_LBA + Unsigned_32(Next_Free_File - 1) * 10;
+   for I in 1..64 loop
+      Buf.Bytes(I-1) := Character'Pos(Rec.Name(I));
+   end loop;
+   Buf.Bytes(64) := Unsigned_8(Rec.Size and 16#FF#);
+   Buf.Bytes(65) := Unsigned_8(Shift_Right(Rec.Size, 8) and 16#FF#);
+   Buf.Bytes(66) := Unsigned_8(Shift_Right(Rec.Size, 16) and 16#FF#);
+   Buf.Bytes(67) := Unsigned_8(Shift_Right(Rec.Size, 24) and 16#FF#);
+   Buf.Bytes(68) := Unsigned_8(Rec.Start_LBA and 16#FF#);
+   Buf.Bytes(69) := Unsigned_8(Shift_Right(Rec.Start_LBA, 8) and 16#FF#);
+   Buf.Bytes(70) := Unsigned_8(Shift_Right(Rec.Start_LBA, 16) and 16#FF#);
+   Buf.Bytes(71) := Unsigned_8(Shift_Right(Rec.Start_LBA, 24) and 16#FF#);
+
+   Write_Sector(Unsigned_32(FileTable_Start_LBA + Next_Free_File - 1), Buf);
+   File_Table(Next_Free_File) := Rec;
+   Next_Free_File := Next_Free_File + 1;
+
+   PutString("File created: ");
+   Putln(FName);
+   end Create_File;
+   procedure List_Files is
+   Buf : Sector_Buffer(As_Words => False);
+   Name : String(1..64);
+   Found : Boolean := False;
+begin
+   for I in 1..Max_Files loop
+      Read_Sector(Unsigned_32(FileTable_Start_LBA + I - 1), Buf);
+      for J in 1..64 loop
+         Name(J) := Character'Val(Buf.Bytes(J-1));
+      end loop;
+      if Name(1) /= Character'Val(0) and then Name(1) /= ' ' then
+         PutString(Name);
+         New_Line;
+         Found := True;
+      end if;
+   end loop;
+   if not Found then
+      Putln("No files.");
+   end if;
+   end List_Files;
+   procedure Cat_File (FName : String) is
+   Buf : Sector_Buffer(As_Words => False);
+   Name : String(1..64);
+   File_Size : Unsigned_32;
+   Start_LBA : Unsigned_32;
+   Found : Boolean := False;
+   Data_Buf : Sector_Buffer(As_Words => False);
+begin
+   for I in 1..Max_Files loop
+      Read_Sector(Unsigned_32(FileTable_Start_LBA + I - 1), Buf);
+      for J in 1..64 loop
+         Name(J) := Character'Val(Buf.Bytes(J-1));
+      end loop;
+      if Equal(Name, FName) then
+         Found := True;
+         File_Size := Unsigned_32(Buf.Bytes(64)) or
+                      (Unsigned_32(Buf.Bytes(65)) * 2**8) or
+                      (Unsigned_32(Buf.Bytes(66)) * 2**16) or
+                      (Unsigned_32(Buf.Bytes(67)) * 2**24);
+         Start_LBA := Unsigned_32(Buf.Bytes(68)) or
+                      (Unsigned_32(Buf.Bytes(69)) * 2**8) or
+                      (Unsigned_32(Buf.Bytes(70)) * 2**16) or
+                      (Unsigned_32(Buf.Bytes(71)) * 2**24);
+         exit;
+      end if;
+   end loop;
+   if not Found then
+      Putln("File not found.");
+      return;
+   end if;
+
+
+   declare
+      Sectors : constant Integer := Integer(File_Size + 511) / 512;
+   begin
+      for Sec in 0 .. Sectors - 1 loop
+         Read_Sector(Start_LBA + Unsigned_32(Sec), Data_Buf);
+
+         for Byte_Idx in 0 .. 511 loop
+            declare
+               Global_Idx : constant Unsigned_32 := Unsigned_32(Sec) * 512 + Unsigned_32(Byte_Idx);
+            begin
+               exit when Global_Idx >= File_Size;
+               PutChar(Character'Val(Data_Buf.Bytes(Byte_Idx)));
+            end;
+         end loop;
+      end loop;
+   end;
+   New_Line;
+end Cat_File;
    --==========================================--
 function Read_Key return Character is
    Status  : Unsigned_8;
@@ -272,14 +493,20 @@ begin
    Buffer(Pos + 1) := Character'Val(0);  --
    Length := Pos;
 end Read_Line;
----------------------------------------------
+   ---------------------------------------------
+   procedure Putln(s:String)is
+   begin
+      PutString(s);
+      New_Line;
+   end Putln;
+   ---------------------------------------------
 begin
    Init_Key_Maps;
    ClearScreen;
    PutString("================");
    Busy_Wait(2000);
    New_Line;
-   PutString("SiNetDOS - Alpha 1");
+   Putln("SiNetDOS - Alpha 1");
    PutString("Welcome back!");
    declare
       Buffer : String(1..80);
@@ -300,6 +527,30 @@ begin
                   if I < Count then PutChar(' '); end if;
                end loop;
                New_Line;
+            elsif Equal(Tokens(1), "diskinfo") then
+               declare
+                  Buf : Sector_Buffer(As_Words => False);
+               begin
+                  Read_Sector(0, Buf);
+                  PutString("LBA 0 first 16 bytes: ");
+                  New_Line;
+                  for I in 0 .. 15 loop
+                     PutChar(Character'Val(Buf.Bytes(I) mod 128));
+                  end loop;
+                  New_Line;
+               end;
+            elsif Equal(Tokens(1), "format") then
+               Format_Disk;
+            elsif Equal(Tokens(1), "mkfile") then
+               if Count >= 2 then
+                  Create_File(Tokens(2));
+               end if;
+            elsif Equal(Tokens(1), "ls") then
+               List_Files;
+            elsif Equal(Tokens(1), "cat") then
+               if Count >= 2 then
+                  Cat_File(Tokens(2));
+               end if;
             else
                PutString("Unknown command: ");
                PutString(Tokens(1));
