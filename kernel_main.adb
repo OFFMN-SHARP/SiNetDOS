@@ -70,11 +70,32 @@ procedure kernel_main is
    end ClearScreen;
 
    function Equal (S1, S2 : String) return Boolean is
+   Len1 : Integer := 0;
+   Len2 : Integer := 0;
 begin
-   if S1'Length /= S2'Length then return False; end if;
-   for I in S1'Range loop
-      if S1(I) /= S2(I + S2'First - S1'First) then return False; end if;
+   for I in reverse S1'Range loop
+      if S1(I) /= ' ' then
+         Len1 := I - S1'First + 1;
+         exit;
+      end if;
    end loop;
+   for I in reverse S2'Range loop
+      if S2(I) /= ' ' then
+         Len2 := I - S2'First + 1;
+         exit;
+      end if;
+   end loop;
+
+   if Len1 /= Len2 then
+      return False;
+   end if;
+
+   for I in 1 .. Len1 loop
+      if S1(S1'First + I - 1) /= S2(S2'First + I - 1) then
+         return False;
+      end if;
+   end loop;
+
    return True;
 end Equal;
    ------------------------------------------------------
@@ -258,12 +279,14 @@ begin
    PutString("================");
    Busy_Wait(2000);
    New_Line;
-   PutString("SiNetDOS ready.");
+   PutString("SiNetDOS - Alpha 1");
+   PutString("Welcome back!");
    declare
       Buffer : String(1..80);
       Len : Integer;
    begin
       loop
+         New_Line;
          PutChar('>');
          Read_Line(Buffer, Len);
          ParseCmd(Buffer(1..Len));
@@ -283,8 +306,6 @@ begin
                New_Line;
             end if;
          end if;
-         New_Line;
-         New_Line;
       end loop;
       --loop null; end loop;
    end;
