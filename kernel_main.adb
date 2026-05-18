@@ -1,12 +1,14 @@
 with System;
 with System.Machine_Code;
-procedure kernel_main is
+with Ada.Unchecked_Conversion;
+procedure kernel_main (Magic : Integer; Multiboot_Info : Integer) is
+   type Unsigned_32 is mod 2**32;
+   function To_Address is new Ada.Unchecked_Conversion (Unsigned_32, System.Address);
    procedure Putln (S : String);
    procedure Cat_File (FName : String);
    type Word is mod 2**16;
    type Unsigned_8  is mod 2**8;
    type Unsigned_16 is mod 2**16;
-   type Unsigned_32 is mod 2**32;
    type File_Record is record
       Name    : String(1..64);
       Size    : Unsigned_32;
@@ -20,9 +22,6 @@ procedure kernel_main is
    Cursor : Integer := 0;
    Max_Files : constant := 65536;
    Superblock_LBA : constant := 0;
-   FileTable_Start_LBA : constant := 1;
-   Data_Start_LBA : constant := 1000;
-   Max_Files       : constant := 65536;
    FileTable_Start : constant Unsigned_32 := 1;
    FileTable_End   : constant Unsigned_32 := FileTable_Start + Max_Files - 1;
    Data_Start_LBA  : constant Unsigned_32 := FileTable_End + 1;
@@ -114,7 +113,23 @@ begin
    end loop;
 
    return True;
-end Equal;
+   end Equal;
+   function Get_Memory_Size (Multiboot_Info : Unsigned_32) return Unsigned_32 is
+   type Multiboot_Info_Record is record
+      Flags      : Unsigned_32;
+      Mem_Lower  : Unsigned_32;
+      Mem_Upper  : Unsigned_32;
+   end record;
+   Info : Multiboot_Info_Record;
+   for Info'Address use To_Address(Multiboot_Info);
+   pragma Import (Ada, Info);
+begin
+   if (Info.Flags and 1) = 1 then
+      return (Info.Mem_Lower + Info.Mem_Upper) * 1024;
+   else
+      return 0;
+   end if;
+end Get_Memory_Size;
    ------------------------------------------------------
    type Token_Array is array (1 .. 10) of String(1..32);
 Tokens : Token_Array;
@@ -334,45 +349,53 @@ begin
    end loop;
 
    Putln("Disk formatted. Max files: 65536");
-end Format_Disk;
-   procedure Create_File (FName : String) is
+   end Format_Disk;
+   function Count_Files return Unsigned_32 is
    Buf : Sector_Buffer(As_Words => False);
-   Rec : File_Record;
+   Count : Unsigned_32 := 0;
 begin
-   if Next_Free_File > Max_Files then
+   for LBA in FileTable_Start .. FileTable_End loop
+      Read_Sector(LBA, Buf);
+      if Buf.Bytes(0) /= 0 and then Buf.Bytes(0) /= 16#20# then
+         Count := Count + 1;
+      end if;
+   end loop;
+   return Count;
+   end Count_Files;
+      function Find_Free_Entry return Unsigned_32;
+   procedure Create_File (FName : String) is
+   LBA : Unsigned_32;
+   Buf : Sector_Buffer(As_Words => False);
+begin
+   LBA := Find_Free_Entry;
+   if LBA = 0 then
       Putln("File table full.");
       return;
    end if;
-   Rec.Name := (others => ' ');
-   Rec.Name(1..FName'Length) := FName;
-   Rec.Size := 0;
-   Rec.Start_LBA := Data_Start_LBA + Unsigned_32(Next_Free_File - 1) * 10;
-   for I in 1..64 loop
-      Buf.Bytes(I-1) := Character'Pos(Rec.Name(I));
+   for I in 1..FName'Length loop
+      Buf.Bytes(I-1) := Character'Pos(FName(I));
    end loop;
-   Buf.Bytes(64) := Unsigned_8(Rec.Size and 16#FF#);
-   Buf.Bytes(65) := Unsigned_8(Shift_Right(Rec.Size, 8) and 16#FF#);
-   Buf.Bytes(66) := Unsigned_8(Shift_Right(Rec.Size, 16) and 16#FF#);
-   Buf.Bytes(67) := Unsigned_8(Shift_Right(Rec.Size, 24) and 16#FF#);
-   Buf.Bytes(68) := Unsigned_8(Rec.Start_LBA and 16#FF#);
-   Buf.Bytes(69) := Unsigned_8(Shift_Right(Rec.Start_LBA, 8) and 16#FF#);
-   Buf.Bytes(70) := Unsigned_8(Shift_Right(Rec.Start_LBA, 16) and 16#FF#);
-   Buf.Bytes(71) := Unsigned_8(Shift_Right(Rec.Start_LBA, 24) and 16#FF#);
-
-   Write_Sector(Unsigned_32(FileTable_Start_LBA + Next_Free_File - 1), Buf);
-   File_Table(Next_Free_File) := Rec;
-   Next_Free_File := Next_Free_File + 1;
-
+   Buf.Bytes(64..67) := (others => 0);
+   declare
+      File_Index : Unsigned_32 := LBA - FileTable_Start;
+      Start : constant Unsigned_32 := Data_Start_LBA + File_Index * 10;
+   begin
+      Buf.Bytes(68) := Unsigned_8(Start and 16#FF#);
+      Buf.Bytes(69) := Unsigned_8(Shift_Right(Start, 8) and 16#FF#);
+      Buf.Bytes(70) := Unsigned_8(Shift_Right(Start, 16) and 16#FF#);
+      Buf.Bytes(71) := Unsigned_8(Shift_Right(Start, 24) and 16#FF#);
+   end;
+   Write_Sector(LBA, Buf);
    PutString("File created: ");
-   Putln(FName);
-   end Create_File;
+      Putln(FName);
+end Create_File;
    procedure List_Files is
    Buf : Sector_Buffer(As_Words => False);
    Name : String(1..64);
    Found : Boolean := False;
 begin
    for I in 1..Max_Files loop
-      Read_Sector(Unsigned_32(FileTable_Start_LBA + I - 1), Buf);
+      Read_Sector(FileTable_Start + Unsigned_32(I - 1), Buf);
       for J in 1..64 loop
          Name(J) := Character'Val(Buf.Bytes(J-1));
       end loop;
@@ -395,7 +418,7 @@ begin
    Data_Buf : Sector_Buffer(As_Words => False);
 begin
    for I in 1..Max_Files loop
-      Read_Sector(Unsigned_32(FileTable_Start_LBA + I - 1), Buf);
+      Read_Sector(FileTable_Start + Unsigned_32(I - 1), Buf);
       for J in 1..64 loop
          Name(J) := Character'Val(Buf.Bytes(J-1));
       end loop;
@@ -435,7 +458,88 @@ begin
       end loop;
    end;
    New_Line;
-end Cat_File;
+   end Cat_File;
+   function Find_Free_Entry return Unsigned_32 is
+   Buf : Sector_Buffer(As_Words => False);
+begin
+   for LBA in FileTable_Start .. FileTable_End loop
+      Read_Sector(LBA, Buf);
+      if Buf.Bytes(0) = 0 or else Buf.Bytes(0) = 16#20# then
+         return LBA;
+      end if;
+   end loop;
+   return 0;
+   end Find_Free_Entry;
+   function Find_File_LBA (FName : String) return Unsigned_32 is
+   Buf : Sector_Buffer(As_Words => False);
+   Name : String(1..64);
+begin
+   for LBA in FileTable_Start .. FileTable_End loop
+      Read_Sector(LBA, Buf);
+      if Buf.Bytes(0) = 0 or else Buf.Bytes(0) = 16#20# then
+         goto Continue;
+      end if;
+      for J in 1..64 loop
+         Name(J) := Character'Val(Buf.Bytes(J-1));
+      end loop;
+      if Equal(Name, FName) then
+         return LBA;
+      end if;
+      <<Continue>>
+   end loop;
+   return 0;
+   end Find_File_LBA;
+   procedure Write_File (FName : String; Data : String) is
+   LBA : Unsigned_32;
+   Buf : Sector_Buffer(As_Words => False);
+   File_Size : Unsigned_32;
+   Start_LBA : Unsigned_32;
+begin
+   LBA := Find_File_LBA(FName);
+   if LBA = 0 then
+      Putln("File not found.");
+      return;
+   end if;
+   Read_Sector(LBA, Buf);
+   File_Size := Unsigned_32(Buf.Bytes(64)) or
+                (Unsigned_32(Buf.Bytes(65)) * 2**8) or
+                (Unsigned_32(Buf.Bytes(66)) * 2**16) or
+                (Unsigned_32(Buf.Bytes(67)) * 2**24);
+   Start_LBA := Unsigned_32(Buf.Bytes(68)) or
+                (Unsigned_32(Buf.Bytes(69)) * 2**8) or
+                (Unsigned_32(Buf.Bytes(70)) * 2**16) or
+                (Unsigned_32(Buf.Bytes(71)) * 2**24);
+   if Data'Length > 10 * 512 then
+      Putln("Data too large (max 5KB).");
+      return;
+   end if;
+
+   declare
+      Data_Idx : Integer := Data'First;
+      Ch : Unsigned_8;
+   begin
+      for Sec in 0 .. 9 loop
+         Buf.Bytes := (others => 0);
+         for Byte_Idx in 0 .. 511 loop
+            exit when Data_Idx > Data'Last;
+            Buf.Bytes(Byte_Idx) := Character'Pos(Data(Data_Idx));
+            Data_Idx := Data_Idx + 1;
+         end loop;
+         Write_Sector(Start_LBA + Unsigned_32(Sec), Buf);
+         if Data_Idx > Data'Last then
+            exit;
+         end if;
+      end loop;
+   end;
+   File_Size := Unsigned_32(Data'Length);
+   Buf.Bytes(64) := Unsigned_8(File_Size and 16#FF#);
+   Buf.Bytes(65) := Unsigned_8(Shift_Right(File_Size, 8) and 16#FF#);
+   Buf.Bytes(66) := Unsigned_8(Shift_Right(File_Size, 16) and 16#FF#);
+   Buf.Bytes(67) := Unsigned_8(Shift_Right(File_Size, 24) and 16#FF#);
+   Write_Sector(LBA, Buf);
+
+   Putln("Written.");
+end Write_File;
    --==========================================--
 function Read_Key return Character is
    Status  : Unsigned_8;
@@ -499,6 +603,23 @@ end Read_Line;
       PutString(s);
       New_Line;
    end Putln;
+   procedure Put_Number (N : Unsigned_32) is
+      Divisor : Unsigned_32 := 1000000000;
+      Started : Boolean := False;
+   begin
+      if N = 0 then PutChar('0'); return; end if;
+      while Divisor > 0 loop
+         declare
+            Digit : constant Unsigned_32 := N / Divisor mod 10;
+         begin
+            if Digit /= 0 or Started or Divisor = 1 then
+               PutChar(Character'Val(48 + Digit));
+               Started := True;
+            end if;
+            Divisor := Divisor / 10;
+         end;
+      end loop;
+   end Put_Number;
    ---------------------------------------------
 begin
    Init_Key_Maps;
@@ -507,11 +628,19 @@ begin
    Busy_Wait(2000);
    New_Line;
    Putln("SiNetDOS - Alpha 1");
-   PutString("Welcome back!");
+   Putln("Welcome back!");
+   PutString("Total memory: ");
    declare
       Buffer : String(1..80);
       Len : Integer;
+      Mem : Unsigned_32 := Get_Memory_Size(Unsigned_32(Multiboot_Info));
    begin
+      Put_Number(Mem);
+      PutString(" bytes");
+      New_Line;
+      PutString("Files on disk: ");
+      Put_Number(Count_Files);
+      New_Line;
       loop
          New_Line;
          PutChar('>');
@@ -551,6 +680,15 @@ begin
                if Count >= 2 then
                   Cat_File(Tokens(2));
                end if;
+            elsif Equal(Tokens(1), "write") then
+               if Count >= 3 then
+                  Write_File(Tokens(2), Tokens(3));
+               else
+                  Putln("Usage: write <file> <text>");
+               end if;
+            elsif Equal(Tokens(1), "mem") then
+               Put_Number(Get_Memory_Size(Unsigned_32(Multiboot_Info)));
+               Putln(" bytes");
             else
                PutString("Unknown command: ");
                PutString(Tokens(1));
